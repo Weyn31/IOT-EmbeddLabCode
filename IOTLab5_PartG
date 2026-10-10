@@ -1,0 +1,309 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+
+
+const int SDA_PIN = 16, SCL_PIN = 17;
+const int PUMP_PIN  = 22;               
+const int VALVE_PIN = 23;                
+byte rowPins[4] = {13, 12, 14, 27};
+byte colPins[4] = {26, 25, 33, 32};
+
+
+const int LED_IDLE_PIN  = 18;
+const int LED_RUN_PIN   = 19;
+const int LED_HOLD_PIN  = 21;            
+const int LED_FAULT_PIN = 5;            
+const int BUZZER_PIN    = 15;
+
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+
+const unsigned long SETTLE_MS = 1500;                    
+const int RUN_MIN_ALLOWED = 1, RUN_MAX_ALLOWED = 15;     
+unsigned long hardMaxMs = 20UL * 60UL * 1000UL;          
+int runMinutes = 5;                                      
+
+
+enum PumpPhase { PH_IDLE, PH_OPENING, PH_RUNNING, PH_CLOSING };
+const char* PH_NAMES[] = {"IDLE", "OPENING", "RUNNING", "CLOSING"};
+PumpPhase phase = PH_IDLE;
+unsigned long tPhase = 0;
+
+const int STOP_NONE = 0, STOP_TIMER = 1, STOP_HARD = 2, STOP_MANUAL = 3;
+const char* STOP_TEXT[] = {"-", "Entered time reached", "FIRMWARE SAFETY LIMIT", "Manual stop"};
+
+bool cycleActive = false;
+bool startReq = false, stopReq = false, ackReq = false;
+unsigned long runStarted = 0;           
+unsigned long activeRunMs = 0;           
+bool cutoffTripped = false;
+unsigned long cutoffElapsedMs = 0;
+int lastStop = STOP_NONE;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);      
+char keys[4][4] = {{'1','2','3','A'},{'4','5','6','B'},{'7','8','9','C'},{'*','0','#','D'}};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, 4, 4);
+
+
+bool entering = false;
+String inBuf = "";
+unsigned long inStart = 0, flashUntil = 0;
+
+
+inline void pumpOn()   { digitalWrite(PUMP_PIN,  RELAY_ON);  }
+inline void pumpOff()  { digitalWrite(PUMP_PIN,  RELAY_OFF); }
+inline void valveOn()  { digitalWrite(VALVE_PIN, RELAY_ON);  }
+inline void valveOff() { digitalWrite(VALVE_PIN, RELAY_OFF); }
+
+bool runTimeExpired() {
+  unsigned long elapsed = millis() - runStarted;
+  if (elapsed > hardMaxMs) {
+    cutoffTripped = true;
+    cutoffElapsedMs = elapsed;
+    return true;
+  }
+  return elapsed > activeRunMs;
+}
+
+unsigned long remainingSec() {
+  unsigned long elapsed = millis() - runStarted;
+  if (elapsed >= activeRunMs) return 0;
+  return (activeRunMs - elapsed + 999) / 1000;
+}
+
+
+void servicePump(bool wantRun) {
+  unsigned long now = millis();
+  switch (phase) {
+    case PH_IDLE:
+      if (wantRun) { valveOn(); tPhase = now; phase = PH_OPENING;
+                     Serial.printf("[seq] %lu ms: valve opened\n", now); }
+      break;
+    case PH_OPENING:                                   
+      if (!wantRun) { tPhase = now; phase = PH_CLOSING; }
+      else if (now - tPhase >= SETTLE_MS) {
+        pumpOn(); runStarted = now; phase = PH_RUNNING;
+        Serial.printf("[seq] %lu ms: pump started (run timer starts now)\n", now);
+      }
+      break;
+    case PH_RUNNING:
+      if (!wantRun) {
+        pumpOff(); tPhase = now; phase = PH_CLOSING;
+        Serial.printf("[seq] %lu ms: pump stopped\n", now);
+      }
+      break;
+    case PH_CLOSING:                                  
+      if (now - tPhase >= SETTLE_MS) {
+        valveOff(); phase = PH_IDLE;
+        Serial.printf("[seq] %lu ms: valve closed\n", now);
+      }
+      break;
+  }
+}
+
+
+void startCycle() {
+  if (cycleActive || phase != PH_IDLE) { Serial.println("[cycle] already running"); return; }
+  if (cutoffTripped) { Serial.println("[cycle] refused: acknowledge the safety cutoff first (D or 'ack')"); return; }
+  cycleActive = true;
+  activeRunMs = (unsigned long)runMinutes * 60000UL;   // snapshot: edits apply next cycle
+  lastStop = STOP_NONE;
+  Serial.printf("[cycle] START: entered run time %d min (%lu s), firmware limit %lu s\n",
+                runMinutes, activeRunMs / 1000UL, hardMaxMs / 1000UL);
+}
+
+void endCycle(int reason) {
+  cycleActive = false;
+  lastStop = reason;
+  unsigned long elapsed = millis() - runStarted;
+  if (reason == STOP_HARD) {
+    Serial.println("************************************************");
+    Serial.printf("[SAFETY] firmware limit reached: pump stopped after %.1f s\n", elapsed / 1000.0);
+    Serial.printf("[SAFETY] entered run time was %lu s, firmware limit was %lu s\n",
+                  activeRunMs / 1000UL, hardMaxMs / 1000UL);
+    Serial.println("[SAFETY] the limit, not the entered time, ended this cycle");
+    Serial.println("************************************************");
+  } else {
+    Serial.printf("[cycle] STOP: %s after %.1f s of pumping\n", STOP_TEXT[reason], elapsed / 1000.0);
+  }
+}
+
+void updateControl() {
+  if (!cycleActive) {
+    if (startReq) startCycle();
+    startReq = false;
+    stopReq = false;
+  } else {
+    int sr = STOP_NONE;
+    if (phase == PH_RUNNING && runTimeExpired()) sr = cutoffTripped ? STOP_HARD : STOP_TIMER;
+    if (stopReq) sr = STOP_MANUAL;
+    stopReq = false;
+    startReq = false;
+    if (sr != STOP_NONE) endCycle(sr);
+  }
+  if (ackReq) {
+    ackReq = false;
+    if (cutoffTripped && !cycleActive) { cutoffTripped = false; Serial.println("[cycle] safety cutoff acknowledged"); }
+  }
+  servicePump(cycleActive);
+}
+
+
+void lcdLine(int row, const char* s) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%-16s", s);
+  lcd.setCursor(0, row);
+  lcd.print(buf);
+}
+
+void lcdKeepAlive() {                                  
+  static unsigned long t = 0;
+  if (millis() - t >= 5000) { t = millis(); lcd.init(); lcd.backlight(); }
+}
+
+void updateLcd() {
+  static unsigned long t = 0;
+  unsigned long now = millis();
+  if (now - t < 250) return;
+  t = now;
+  char l0[24], l1[24];
+  unsigned long hm = hardMaxMs / 1000UL;
+  if (hm > 5999) hm = 5999;
+
+  if (entering) {
+    snprintf(l0, sizeof(l0), "Run time (%d-%dm)", RUN_MIN_ALLOWED, RUN_MAX_ALLOWED);
+    if (now < flashUntil) snprintf(l1, sizeof(l1), "Out of range");
+    else                  snprintf(l1, sizeof(l1), "> %s_", inBuf.c_str());
+  } else if (cutoffTripped) {
+    unsigned long es = cutoffElapsedMs / 1000UL;
+    if (es > 5999) es = 5999;
+    snprintf(l0, sizeof(l0), "SAFETY LIMIT HIT");
+    if ((now / 2000) % 2 == 0) snprintf(l1, sizeof(l1), "Stopped at %02lu:%02lu", es / 60, es % 60);
+    else                       snprintf(l1, sizeof(l1), "D = acknowledge");
+  } else if (phase == PH_OPENING) {
+    snprintf(l0, sizeof(l0), "Valve opening...");
+    snprintf(l1, sizeof(l1), "Set%2dm Max %02lu:%02lu", runMinutes, hm / 60, hm % 60);
+  } else if (phase == PH_RUNNING) {
+    unsigned long r = remainingSec();
+    snprintf(l0, sizeof(l0), "RUN  %02lu:%02lu left", r / 60, r % 60);
+    snprintf(l1, sizeof(l1), "Set%2dm Max %02lu:%02lu", runMinutes, hm / 60, hm % 60);
+  } else if (phase == PH_CLOSING) {
+    snprintf(l0, sizeof(l0), "Pump off, closing");
+    snprintf(l1, sizeof(l1), "%s", lastStop == STOP_TIMER ? "Entered time done" : "Stopped");
+  } else {
+    snprintf(l0, sizeof(l0), "IDLE  Run:%2d min", runMinutes);
+    snprintf(l1, sizeof(l1), "Max %02lu:%02lu C=start", hm / 60, hm % 60);
+  }
+  lcdLine(0, l0);
+  lcdLine(1, l1);
+}
+
+void updateIndicators() {
+  digitalWrite(LED_FAULT_PIN, cutoffTripped ? HIGH : LOW);
+  digitalWrite(LED_RUN_PIN,   (phase != PH_IDLE) ? HIGH : LOW);
+  digitalWrite(LED_IDLE_PIN,  (phase == PH_IDLE && !cutoffTripped) ? HIGH : LOW);
+  digitalWrite(LED_HOLD_PIN,  LOW);
+ 
+  bool buz = cutoffTripped && (millis() % 2000) < 1000;
+  digitalWrite(BUZZER_PIN, buz ? HIGH : LOW);
+}
+
+
+void handleKey(char k) {
+  if (!k) return;
+  if (!entering) {
+    switch (k) {
+      case 'A': entering = true; inBuf = ""; inStart = millis(); break;
+      case 'C': startReq = true; break;
+      case 'D': if (cycleActive) stopReq = true; else ackReq = true; break;
+    }
+    return;
+  }
+  inStart = millis();
+  if (k >= '0' && k <= '9') {
+    if (inBuf.length() < 2) inBuf += k;
+  } else if (k == '*') {
+    entering = false;
+  } else if (k == '#') {
+    int v = inBuf.toInt();
+    if (inBuf.length() > 0 && v >= RUN_MIN_ALLOWED && v <= RUN_MAX_ALLOWED) {
+      runMinutes = v;
+      Serial.printf("[cfg] run time = %d min (applies to the next cycle)\n", v);
+      entering = false;
+    } else {
+      inBuf = "";
+      flashUntil = millis() + 1500;
+    }
+  }
+}
+
+
+void printStatus() {
+  Serial.printf("[status] phase=%s run=%d min (active %lu s) hardmax=%lu s cutoff=%d lastStop=%s\n",
+                PH_NAMES[phase], runMinutes, activeRunMs / 1000UL, hardMaxMs / 1000UL,
+                cutoffTripped, STOP_TEXT[lastStop]);
+}
+
+void handleSerial() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  float v = 0;
+  if (sscanf(line.c_str(), "runtime %f", &v) == 1) {
+    if (v >= RUN_MIN_ALLOWED && v <= RUN_MAX_ALLOWED) { runMinutes = (int)v; Serial.printf("run time = %d min (next cycle)\n", runMinutes); }
+    else Serial.printf("out of range (%d-%d)\n", RUN_MIN_ALLOWED, RUN_MAX_ALLOWED);
+  }
+  else if (sscanf(line.c_str(), "hardmax %f", &v) == 1) {
+    if (v >= 5) { hardMaxMs = (unsigned long)(v * 1000.0); Serial.printf("firmware limit = %.0f s\n", v); }
+    else Serial.println("hardmax must be at least 5 s");
+  }
+  else if (line == "start")  { startReq = true; }
+  else if (line == "stop")   { stopReq = true; }
+  else if (line == "ack")    { ackReq = true; }
+  else if (line == "status") { printStatus(); }
+  else if (line.length())    { Serial.println("commands: runtime <min>, hardmax <sec>, start, stop, ack, status"); }
+}
+
+void logCsv() {
+  static unsigned long t = 0;
+  unsigned long now = millis();
+  if (now - t < 1000) return;
+  t = now;
+  if (phase == PH_IDLE && !cycleActive) return;
+  unsigned long elapsed = (phase == PH_RUNNING) ? (now - runStarted) / 1000UL : 0;
+  Serial.printf("LOG,%lu,%s,elapsed_s=%lu,remaining_s=%lu,entered_s=%lu,hardmax_s=%lu\n",
+                now, PH_NAMES[phase], elapsed, (phase == PH_RUNNING) ? remainingSec() : 0UL,
+                activeRunMs / 1000UL, hardMaxMs / 1000UL);
+}
+
+void setup() {
+  digitalWrite(PUMP_PIN, RELAY_OFF);  pinMode(PUMP_PIN, OUTPUT);  pumpOff();
+  digitalWrite(VALVE_PIN, RELAY_OFF); pinMode(VALVE_PIN, OUTPUT); valveOff();
+
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\nLAB 5 - PART G: safety limit");
+
+  int outs[] = {LED_IDLE_PIN, LED_RUN_PIN, LED_HOLD_PIN, LED_FAULT_PIN, BUZZER_PIN};
+  for (int p : outs) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }   
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  delay(200);
+  lcd.init();
+  lcd.backlight();
+
+  Serial.println("Test: runtime 15 -> hardmax 30 -> start. The pump must stop at 30 s, not 15 min.");
+  printStatus();
+}
+
+void loop() {
+  lcdKeepAlive();
+  handleKey(keypad.getKey());
+  if (entering && millis() - inStart > 15000) entering = false;         handleSerial();
+  updateControl();
+  updateIndicators();
+  updateLcd();
+  logCsv();
+} 
