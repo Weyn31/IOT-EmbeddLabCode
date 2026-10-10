@@ -1,0 +1,231 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+
+#define WIFI_SSID "Irma Gilda’s iPhone"
+#define WIFI_PASS "xpkaapejw47r4"
+
+const char* LAT = "14.676";             
+const char* LON = "121.044";
+const int   FORECAST_HOURS = 6;          
+const long  GMT_OFFSET_S   = 8 * 3600;  
+
+
+String FORECAST_URL = String("https://api.open-meteo.com/v1/forecast?latitude=") + LAT +
+                      "&longitude=" + LON +
+                      "&hourly=temperature_2m,precipitation_probability" +
+                      "&forecast_hours=" + FORECAST_HOURS +
+                      "&timezone=Asia%2FManila";
+
+const unsigned long FETCH_MS = 30UL * 60UL * 1000UL;   // scheduled fetch: twice an hour
+
+
+float rainChance   = 0;              
+float tempForecast = NAN;            
+float tempMin = NAN, tempMax = NAN;  
+unsigned long forecastAt = 0;        
+bool forecastOk = false;
+unsigned long lastFetchTry = 0;
+
+
+void banner(const char* text) {
+  Serial.println();
+  Serial.println("==================================================");
+  Serial.println(text);
+  Serial.println("==================================================");
+}
+
+const char* rssiQuality(int rssi) {
+  if (rssi >= -55) return "excellent";
+  if (rssi >= -67) return "good";
+  if (rssi >= -75) return "fair";
+  if (rssi >= -85) return "weak";
+  return "very weak";
+}
+
+
+bool connectWiFi() {
+  banner("STEP 1: Connect to WiFi (station mode)");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to \"%s\" ", WIFI_SSID);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("FAILED (status code %d).\n", WiFi.status());
+    Serial.println("Check: SSID/password spelling, 2.4 GHz band (ESP32 has no 5 GHz),");
+    Serial.println("       and that the access point is within range.");
+    return false;
+  }
+
+  int rssi = WiFi.RSSI();
+  Serial.println("Connected.");
+  Serial.printf("  IP address : %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("  Gateway    : %s\n", WiFi.gatewayIP().toString().c_str());
+  Serial.printf("  MAC address: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("  Signal     : %d dBm (%s)\n", rssi, rssiQuality(rssi));
+  return true;
+}
+
+bool syncTime() {
+  banner("STEP 2: Obtain network time (NTP)");
+  configTime(GMT_OFFSET_S, 0, "pool.ntp.org", "time.google.com");
+
+  struct tm ti;
+  if (!getLocalTime(&ti, 10000)) {
+    Serial.println("FAILED: no NTP response within 10 s (check internet access).");
+    return false;
+  }
+  Serial.println(&ti, "Local time (UTC+8): %A, %d %B %Y  %H:%M:%S");
+  Serial.printf("Unix epoch         : %lld\n", (long long)time(nullptr));
+  Serial.println("Compare this with a phone or PC clock to confirm it is correct.");
+  return true;
+}
+
+
+bool fetchForecast(bool verbose) {
+  lastFetchTry = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[forecast] WiFi not connected - cannot fetch.");
+    forecastOk = false;
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();                      
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(client, FORECAST_URL);
+  int code = http.GET();
+  Serial.printf("[forecast] HTTP status: %d\n", code);
+
+  if (code != 200) {
+    if (code == 400)      Serial.println("  400 = bad request (check latitude/longitude and URL).");
+    else if (code == 429) Serial.println("  429 = too many requests (rate limit).");
+    else if (code < 0)    Serial.printf("  Connection error: %s\n", http.errorToString(code).c_str());
+    http.end();
+    forecastOk = false;                      
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  
+  if (verbose) {
+    banner("STEP 3: Raw forecast response");
+    Serial.printf("(%d bytes)\n", body.length());
+    Serial.println(body);
+  }
+
+  
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[forecast] JSON parse failed: %s\n", err.c_str());
+    forecastOk = false;
+    return false;
+  }
+
+  JsonArray times = doc["hourly"]["time"].as<JsonArray>();
+  JsonArray temps = doc["hourly"]["temperature_2m"].as<JsonArray>();
+  JsonArray pops  = doc["hourly"]["precipitation_probability"].as<JsonArray>();
+  if (times.isNull() || temps.isNull() || pops.isNull() || times.size() == 0) {
+    Serial.println("[forecast] response is missing the hourly arrays.");
+    forecastOk = false;
+    return false;
+  }
+
+  banner("STEP 4: Parsed forecast values");
+  Serial.println("Hour  Local time (UTC+8)   Temp (C)   Rain prob (%)");
+
+  float maxPop = 0, tMin = 1000, tMax = -1000, firstTemp = NAN;
+  int n = times.size();
+  for (int i = 0; i < n; i++) {
+    const char* when = times[i] | "?";
+    float temp = temps[i] | NAN;
+    float pop  = pops[i] | 0.0f;             
+    Serial.printf("%3d   %-18s  %7.1f    %7.0f\n", i + 1, when, temp, pop);
+
+    if (i == 0) firstTemp = temp;
+    if (pop > maxPop) maxPop = pop;
+    if (!isnan(temp)) { if (temp < tMin) tMin = temp; if (temp > tMax) tMax = temp; }
+  }
+
+  rainChance   = maxPop;
+  tempForecast = firstTemp;
+  tempMin = tMin;
+  tempMax = tMax;
+  forecastAt = millis();
+  forecastOk = true;
+
+  Serial.println("--------------------------------------------------");
+  Serial.printf("Rainfall probability (highest, next %d h): %.0f %%\n", n, rainChance);
+  Serial.printf("Forecast temperature (nearest hour)      : %.1f C\n", tempForecast);
+  Serial.printf("Temperature range over the window        : %.1f to %.1f C\n", tempMin, tempMax);
+  Serial.println("Forecast cached; next scheduled fetch in 30 min.");
+  return true;
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("network connection and forecast retrieval");
+
+  if (!connectWiFi()) {
+    Serial.println(" Fix the WiFi problem and press EN to restart.");
+    return;                                  
+  }
+  if (!syncTime()) {
+    Serial.println("Continuing without verified time (forecast does not depend on it).");
+  }
+  fetchForecast(true);                       
+}
+
+void loop() {
+  static unsigned long tAge = 0, tReconnect = 0;
+  unsigned long now = millis();
+ 
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'r' || c == 'R') fetchForecast(true);
+  }
+
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - tReconnect > 10000) {
+      tReconnect = now;
+      Serial.println("[net] WiFi down - trying to reconnect...");
+      WiFi.reconnect();
+    }
+    return;
+  }
+
+  unsigned long wait = forecastOk ? FETCH_MS : 60000UL;
+  if (lastFetchTry != 0 && now - lastFetchTry >= wait) {
+    fetchForecast(false);
+  }
+
+  if (now - tAge >= 60000UL) {
+    tAge = now;
+    if (forecastOk) {
+      Serial.printf("[cache] rain %.0f %%, temp %.1f C, age %lu min\n",
+                    rainChance, tempForecast, (now - forecastAt) / 60000UL);
+    } else {
+      Serial.println("[cache] no valid forecast yet (stale).");
+    }
+  }
+} 
+
+
