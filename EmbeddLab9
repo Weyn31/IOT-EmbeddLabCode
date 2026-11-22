@@ -1,0 +1,91 @@
+Arduino Code
+
+#include <DHT.h>
+
+#define DHTPIN 2
+#define DHTTYPE DHT11
+#define PIRPIN 3
+
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(PIRPIN, INPUT);
+  dht.begin();
+  Serial.println("--- DHT + PIR Sensor Initialized ---");
+}
+
+void loop() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  int pir = digitalRead(PIRPIN);
+
+  if (!isnan(h) && !isnan(t)) {
+    Serial.print("Temp: ");
+    Serial.print(t, 2);
+    Serial.print(" °C | Humidity: ");
+    Serial.print(h, 2);
+    Serial.print(" % | PIR Motion: ");
+    Serial.println(pir == HIGH ? "Motion Detected! (1)" : "Clear (0)");
+  }
+
+  delay(500);
+}
+
+
+
+
+Server Side:
+import socket, time, random
+import serial
+
+try:
+    ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+    print("Connected to Arduino")
+except:
+    ser = None
+
+HOST, PORT = '0.0.0.0', 5000
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind((HOST, PORT)); srv.listen(1)
+print(f'Waiting for client on port {PORT}')
+conn, addr = srv.accept(); print('Connected:', addr)
+
+try:
+    while True:
+        if ser and ser.in_waiting > 0:
+            value = ser.readline().decode('utf-8').strip()
+        else:
+            value = "0"
+        conn.sendall(f'{time.time():.3f},{value}\n'.encode())
+        time.sleep(0.5)
+except (KeyboardInterrupt, BrokenPipeError):
+    print("\nClosing connection.")
+    conn.close()
+    srv.close()
+    if ser:
+        ser.close()
+
+
+
+Client Side:
+import socket, time
+
+PI_IP, PORT = '10.172.25.150', 5000  # Use the Pi's IP address on the network
+c = socket.socket(); c.connect((PI_IP, PORT))
+print("Connected to Raspberry Pi server!")
+
+for _ in range(20):
+    data = c.recv(1024).decode().strip()
+    if not data:
+        continue
+    for line in data.splitlines():
+        try:
+            sent, value = line.split(',')
+            latency_ms = (time.time() - float(sent)) * 1000
+            print(f'value={value} latency={latency_ms:.1f} ms')
+        except ValueError:
+            pass
+
+c.close()
