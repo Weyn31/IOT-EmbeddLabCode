@@ -1,0 +1,46 @@
+import cv2, numpy as np, serial, time
+
+ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
+time.sleep(2)
+
+cap = cv2.VideoCapture(0)
+print("Starting detection loop.")
+
+while True:
+    ok, frame = cap.read()
+    if not ok:
+        break
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 120, 70), (10, 255, 255))  # Red HSV range
+    detected = cv2.countNonZero(mask) > 500
+    ser.write(b'1' if detected else b'0')
+
+    cv2.imshow('mask', mask)
+    if cv2.waitKey(1) == 27:  # Esc to quit
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+ser.close()
+
+
+Arduino Code
+const int ledPin = 2;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char cmd = Serial.read();
+    if (cmd == '1') {
+      digitalWrite(ledPin, HIGH);
+    } else if (cmd == '0') {
+      digitalWrite(ledPin, LOW);
+    }
+  }
+}
