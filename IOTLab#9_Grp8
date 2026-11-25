@@ -1,0 +1,281 @@
+(Sender)
+#include <SPI.h>
+#include <Wire.h>
+#include <LoRa.h>
+#include <BH1750.h>
+#include <DHT.h>
+#include <Adafruit_BMP280.h>
+
+const char PART = 'C';
+
+#define LORA_FREQ    433E6
+#define LORA_SF      7 -> 12
+#define LORA_BW      125E3
+#define LORA_SYNC    0x34
+#define LORA_TXPWR   14
+
+#define DUTY_LIMIT       0.01
+#define MIN_INTERVAL_MS  5000
+#define PART_A_INTERVAL  2000
+
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define SS_PIN      5
+#define RST_PIN    14
+#define DIO0_PIN   26
+#define DHT_PIN     4
+#define DHT_TYPE   DHT11
+
+Adafruit_BMP280 bmp;
+BH1750 lightMeter(0x23);
+DHT    dht(DHT_PIN, DHT_TYPE);
+bool   bmpOk = false;
+
+struct EnvRecord {
+  uint32_t ts;
+  float tempC, humPct, presHpa, lux;
+  uint8_t flags;
+};
+
+uint8_t checkPlausibility(const EnvRecord& r) {
+  uint8_t f = 0x00;
+  if (isnan(r.tempC)   || r.tempC < -20.0  || r.tempC > 70.0)      f |= 0x01;
+  if (isnan(r.humPct)  || r.humPct < 0.0   || r.humPct > 100.0)    f |= 0x02;
+  if (isnan(r.presHpa) || r.presHpa < 800.0 || r.presHpa > 1100.0) f |= 0x04;
+  if (isnan(r.lux)     || r.lux < 0.0      || r.lux > 100000.0)    f |= 0x08;
+  return f;
+}
+
+EnvRecord acquireData() {
+  EnvRecord r;
+  r.ts      = millis() / 1000;
+  r.tempC   = dht.readTemperature();
+  r.humPct  = dht.readHumidity();
+  r.presHpa = bmpOk ? bmp.readPressure() / 100.0F : NAN;
+  float lx  = lightMeter.readLightLevel();
+  r.lux     = (lx < 0) ? NAN : lx;
+  r.flags   = checkPlausibility(r);
+  return r;
+}
+
+const int PAYLOAD_LEN = 9;
+const uint16_t NA16 = 0xFFFF;
+const int16_t  NA_T = INT16_MIN;
+
+void pack(const EnvRecord& r, uint8_t* b) {
+  int16_t  t = isnan(r.tempC)  ? NA_T : (int16_t)lroundf(r.tempC * 100);
+  uint16_t h = isnan(r.humPct) ? NA16 : (uint16_t)lroundf(r.humPct * 100);
+  uint16_t p = (isnan(r.presHpa) || r.presHpa < 800) ? NA16
+               : (uint16_t)lroundf((r.presHpa - 800) * 10);
+  uint16_t l = NA16;
+  if (!isnan(r.lux)) { long v = lroundf(r.lux / 10); l = (v > 65534) ? 65534 : (uint16_t)v; }
+  b[0] = t >> 8; b[1] = t & 0xFF;
+  b[2] = h >> 8; b[3] = h & 0xFF;
+  b[4] = p >> 8; b[5] = p & 0xFF;
+  b[6] = l >> 8; b[7] = l & 0xFF;
+  b[8] = r.flags;
+}
+
+int jsonSize(const EnvRecord& r) {
+  char js[160];
+  return snprintf(js, sizeof js,
+    "{\"ts\":%lu,\"tempC\":%.2f,\"humPct\":%.2f,\"presHpa\":%.1f,\"lux\":%.1f,\"flags\":%u}",
+    r.ts, r.tempC, r.humPct, r.presHpa, r.lux, r.flags);
+}
+
+void radioBegin() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, SS_PIN);
+  LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
+  if (!LoRa.begin(LORA_FREQ)) { Serial.println("radio init failed"); while (1); }
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(LORA_SYNC);
+  LoRa.setTxPower(LORA_TXPWR);
+  LoRa.enableCrc();
+}
+
+unsigned long lastTx = 0, intervalMs = PART_A_INTERVAL;
+uint32_t counter = 0;
+uint8_t  seq = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  radioBegin();
+  Serial.printf("SENDER Part %c: %.1f MHz SF%d BW%.0f kHz sync 0x%02X %d dBm\n",
+                PART, LORA_FREQ / 1e6, LORA_SF, LORA_BW / 1e3, LORA_SYNC, LORA_TXPWR);
+
+  if (PART != 'A') {
+    Wire.begin(21, 22);
+    dht.begin();
+    if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
+      Serial.println("[WARN] BH1750 init failed");
+    bmpOk = bmp.begin(0x76) || bmp.begin(0x77);
+    if (bmpOk) {
+      bmp.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_500);
+    }
+    Serial.println(bmpOk ? "[OK] BMP280" : "[WARN] BMP280 init failed");
+    intervalMs = MIN_INTERVAL_MS;
+    delay(2000);
+  }
+}
+
+void sendTestMessage() {
+  LoRa.beginPacket();
+  LoRa.printf("LAB9 TEST #%lu", counter);
+  LoRa.endPacket();
+  Serial.printf("sent: LAB9 TEST #%lu\n", counter);
+  counter++;
+}
+
+void sendSensorPacket() {
+  EnvRecord r = acquireData();
+  uint8_t buf[10];
+  pack(r, buf);
+  int len = PAYLOAD_LEN;
+  if (PART == 'C') { buf[9] = seq++; len = 10; }
+
+  LoRa.beginPacket();
+  LoRa.write(buf, len);
+  unsigned long t0 = micros();
+  LoRa.endPacket();
+  float airMs = (micros() - t0) / 1000.0;
+  counter++;
+
+  intervalMs = max((unsigned long)MIN_INTERVAL_MS, (unsigned long)(airMs / DUTY_LIMIT));
+
+  Serial.printf("[TX %lu] T=%.2f H=%.2f P=", counter, r.tempC, r.humPct);
+  if (isnan(r.presHpa)) Serial.print("N/A"); else Serial.printf("%.1f", r.presHpa);
+  Serial.printf(" L=%.1f flags=0x%02X", r.lux, r.flags);
+  if (PART == 'C') Serial.printf(" seq=%u", (uint8_t)(seq - 1));
+  Serial.print("\n        bytes:");
+  for (int i = 0; i < len; i++) Serial.printf(" %02X", buf[i]);
+  Serial.printf("\n        packed=%d B  JSON=%d B  airtime=%.1f ms  next TX in %.1f s\n",
+                PAYLOAD_LEN, jsonSize(r), airMs, intervalMs / 1000.0);
+  if (PART == 'D') {
+    Serial.printf("        Part D: SF%d airtime %.1f ms -> shortest interval at 1%% duty = %.1f s\n",
+                  LORA_SF, airMs, airMs / 0.01 / 1000.0);
+  }
+}
+
+void loop() {
+  if (millis() - lastTx < intervalMs) return;
+  lastTx = millis();
+  if (PART == 'A') sendTestMessage();
+  else             sendSensorPacket();
+}
+
+ (Receiver) 
+#include <SPI.h>
+#include <LoRa.h>
+
+#define LORA_FREQ    433E6
+#define LORA_SF      7 ->12
+#define LORA_BW      125E3
+#define LORA_SYNC    0x34
+#define LORA_TXPWR   14
+
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define SS_PIN      5
+#define RST_PIN    14
+#define DIO0_PIN   26
+
+struct EnvRecord { float tempC, humPct, presHpa, lux; uint8_t flags; };
+
+const int PAYLOAD_LEN = 9;
+void unpack(const uint8_t* b, EnvRecord& r) {
+  int16_t  t = (int16_t)((b[0] << 8) | b[1]);
+  uint16_t h = (b[2] << 8) | b[3];
+  uint16_t p = (b[4] << 8) | b[5];
+  uint16_t l = (b[6] << 8) | b[7];
+  r.tempC   = (t == INT16_MIN) ? NAN : t / 100.0;
+  r.humPct  = (h == 0xFFFF)    ? NAN : h / 100.0;
+  r.presHpa = (p == 0xFFFF)    ? NAN : p / 10.0 + 800.0;
+  r.lux     = (l == 0xFFFF)    ? NAN : l * 10.0;
+  r.flags   = b[8];
+}
+
+void radioBegin() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, SS_PIN);
+  LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
+  if (!LoRa.begin(LORA_FREQ)) { Serial.println("radio init failed"); while (1); }
+  LoRa.setSpreadingFactor(LORA_SF);
+  LoRa.setSignalBandwidth(LORA_BW);
+  LoRa.setCodingRate4(5);
+  LoRa.setSyncWord(LORA_SYNC);
+  LoRa.setTxPower(LORA_TXPWR);
+  LoRa.enableCrc();
+}
+
+void printVal(const char* label, float v, int dec, const char* unit) {
+  Serial.print(label);
+  if (isnan(v)) Serial.print("--"); else Serial.print(v, dec);
+  Serial.print(unit);
+}
+
+bool seqStarted = false;
+uint8_t firstSeq = 0, lastSeq = 0;
+uint32_t rxCount = 0;
+long rssiSum = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+  radioBegin();
+  Serial.printf("RECEIVER: %.1f MHz SF%d BW%.0f kHz sync 0x%02X\n",
+                LORA_FREQ / 1e6, LORA_SF, LORA_BW / 1e3, LORA_SYNC);
+  Serial.println("Count reset. Waiting for packets...");
+}
+
+void loop() {
+  int size = LoRa.parsePacket();
+  if (!size) return;
+
+  uint8_t buf[32]; int n = 0;
+  while (LoRa.available() && n < 32) buf[n++] = LoRa.read();
+  int rssi = LoRa.packetRssi();
+  float snr = LoRa.packetSnr();
+
+  if (n > 4 && memcmp(buf, "LAB9", 4) == 0) {
+    buf[n < 31 ? n : 31] = '\0';
+    Serial.printf("rx \"%s\" (%d bytes) rssi=%d dBm snr=%.1f dB\n", (char*)buf, n, rssi, snr);
+    return;
+  }
+
+  if (n != PAYLOAD_LEN && n != PAYLOAD_LEN + 1) {
+    Serial.printf("rx %d bytes (unexpected length) rssi=%d\n", n, rssi);
+    return;
+  }
+
+  EnvRecord r;
+  unpack(buf, r);
+  rxCount++;
+  rssiSum += rssi;
+
+  uint32_t sent = rxCount;
+  if (n == PAYLOAD_LEN + 1) {
+    if (!seqStarted) { seqStarted = true; firstSeq = buf[9]; }
+    lastSeq = buf[9];
+    sent = (uint8_t)(lastSeq - firstSeq) + 1;
+  }
+
+  Serial.printf("[RX] %d bytes  RSSI=%d dBm  SNR=%.1f dB | ", n, rssi, snr);
+  printVal("T=", r.tempC, 2, "C ");
+  printVal("H=", r.humPct, 2, "% ");
+  printVal("P=", r.presHpa, 1, "hPa ");
+  printVal("L=", r.lux, 0, "lx ");
+  Serial.printf("flags=0x%02X", r.flags);
+  if (n == PAYLOAD_LEN + 1) Serial.printf("  seq=%u", lastSeq);
+  Serial.println();
+
+  if (n == PAYLOAD_LEN + 1) {
+    Serial.printf("     >> SF%d  received %lu / sent %lu  (%.0f%%)  avg RSSI %.1f dBm\n",
+                  LORA_SF, rxCount, sent, 100.0 * rxCount / sent, (float)rssiSum / rxCount);
+  }
+}
