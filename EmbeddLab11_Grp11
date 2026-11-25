@@ -1,0 +1,50 @@
+Send data to Firebase
+
+import time
+import serial
+import firebase_admin
+from firebase_admin import credentials, db
+
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(
+    cred,
+    {"databaseURL": "https://grp11iotlab11-default-rtdb.asia-southeast1.firebasedatabase.app"},
+)
+
+ref = db.reference("readings")
+
+try:
+    ser = serial.Serial("/dev/ttyACM0", 9600, timeout=1)
+    while True:
+        if ser.in_waiting > 0:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if line:
+                ref.push({"sensor_value": line, "ts": time.time()})
+                print(f"Pushed to Firebase -> Sensor Data: {line}")
+        time.sleep(0.5)
+except KeyboardInterrupt:
+    pass
+finally:
+    if "ser" in locals() and ser.is_open:
+        ser.close()
+    print("Serial Connection closed.")
+
+
+Retrieve Data from Firebase
+
+import firebase_admin
+from firebase_admin import credentials, db
+
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(
+    cred,
+    {"databaseURL": "https://grp11iotlab11-default-rtdb.asia-southeast1.firebasedatabase.app"},
+)
+
+rows = db.reference("readings").order_by_key().limit_to_last(10).get()
+
+if rows:
+    for key, rec in rows.items():
+        print(f"Key: {key} | Data: {rec}")
+else:
+    print("No records found.")
